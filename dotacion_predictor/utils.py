@@ -114,7 +114,9 @@ def estimar_parametros_efectividad(df_historico):
     Ahora incluye T_AO_VENTA como variable para la estimación.
     """
     df_fit = df_historico[df_historico['T_AO'] > 0].copy()
-    df_fit = df_fit[(df_fit['DOTACION'] >= 0) & (df_fit['DOTACION'] <= 3)]  # Ajustar solo en rango bajo de dotación
+    # Es importante que DOTACION no sea negativa si la lógica del modelo lo asume.
+    # Si DOTACION puede ser < 0 en los datos, se debe filtrar o aclarar cómo manejarlo.
+    df_fit = df_fit[df_fit['DOTACION'] >= 0] # Asegurar dotaciones no negativas para el ajuste
 
     if df_fit.empty:
         return {'L': 1.0, 'k': 0.5, 'x0_base': 5.0, 'x0_factor_t_ao_venta': 0.05}

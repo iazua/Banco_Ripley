@@ -1,173 +1,118 @@
 import os
 import pandas as pd
 import joblib
-import numpy as np
-import optuna
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.ensemble import StackingRegressor
-from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
+import pyodbc
 from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
-
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from preprocessing import prepare_features
-from preprocessing import _add_lag_features
-from utils import estimar_dotacion_optima, estimar_parametros_efectividad
-import warnings
-warnings.filterwarnings("ignore")
+from sklearn.metrics import mean_absolute_error
+import numpy as np
+from utils import estimar_dotacion_optima, estimar_parametros_efectividad  # Importar las funciones necesarias
 
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 
-def load_data_from_excel(file_path: str) -> pd.DataFrame:
-    """Carga datos desde archivo Excel"""
-    df = pd.read_excel(file_path)
-    df.columns = ["COD_SUC", "FECHA", "T_AO", "T_AO_VENTA", "DOTACION", "T_VISITAS", "P_EFECTIVIDAD"]
-    df["FECHA"] = pd.to_datetime(df["FECHA"])
-    return df.dropna().reset_index(drop=True)
+def load_data_from_excel(file_path):
+    return pd.read_excel(file_path)
 
 
-def evaluate_model(model, X: pd.DataFrame, y: pd.Series, tscv: TimeSeriesSplit) -> dict:
-    """Evalúa el modelo usando validación cruzada temporal"""
-    mae_scores = []
-    r2_scores = []
 
-    for train_idx, test_idx in tscv.split(X):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-
-        mae_scores.append(mean_absolute_error(y_test, y_pred))
-        r2_scores.append(r2_score(y_test, y_pred))
-
-    return {
-        'mae': np.mean(mae_scores),
-        'r2': np.mean(r2_scores),
-        'mae_std': np.std(mae_scores),
-        'r2_std': np.std(r2_scores)
-    }
-
-
-def objective(trial, X: pd.DataFrame, y: pd.Series, tscv: TimeSeriesSplit) -> float:
-    """Función objetivo para optimización con Optuna"""
-    params = {
-        'n_estimators': trial.suggest_int('n_estimators', 50, 1000),
-        'max_depth': trial.suggest_int('max_depth', 3, 15),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'gamma': trial.suggest_float('gamma', 0, 1),
-        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
-        'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
-        'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True)
-    }
-
-    model = XGBRegressor(**params, objective='reg:squarederror', n_jobs=-1, random_state=42)
-
-    scores = []
-    for train_idx, test_idx in tscv.split(X):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        scores.append(mean_absolute_error(y_test, y_pred))
-
-    return np.mean(scores)
-
-
-def train_model_per_branch(df: pd.DataFrame, target: str) -> None:
-    """Entrena modelos por sucursal usando ensamblado y optimización avanzada"""
+def train_model_per_branch(df, target):
     unique_branches = df["COD_SUC"].unique()
-
     for sucursal in unique_branches:
         suc_df = df[df["COD_SUC"] == sucursal].copy()
         X, y = prepare_features(suc_df, target)
 
-        if len(X) < 30:  # Requerimos al menos 30 muestras
+        if len(X) < 10:
             print(f"⚠️ Insuficientes datos para {sucursal} - {target}.")
             continue
 
-        # Validación cruzada temporal
-        tscv = TimeSeriesSplit(n_splits=min(5, len(X) // 3))  # Asegurar al menos 3 muestras por fold
-
-        # Optimización con Optuna solo para XGBoost
-        study = optuna.create_study(direction='minimize')
-        study.optimize(lambda trial: objective(trial, X, y, tscv), n_trials=30, timeout=600)
-
-        # Modelos base para stacking
-        estimators = [
-            ('xgb', XGBRegressor(**study.best_params, objective='reg:squarederror', n_jobs=-1, random_state=42)),
-            ('lgbm', LGBMRegressor(random_state=42)),
-            ('rf', RandomForestRegressor(random_state=42))
-        ]
-
-        # Modelo final con stacking
-        final_model = StackingRegressor(
-            estimators=estimators,
-            final_estimator=Ridge(),
-            n_jobs=-1
+        tscv = TimeSeriesSplit(n_splits=5)
+        model_cv = GridSearchCV(
+            XGBRegressor(objective='reg:squarederror', n_jobs=-1, random_state=42),
+            param_grid={"n_estimators": [50, 100], "max_depth": [3, 5]},
+            cv=tscv, scoring="neg_mean_absolute_error", n_jobs=-1
         )
+        model_cv.fit(X, y)
 
-        # Entrenamiento y evaluación
-        final_model.fit(X, y)
-        metrics = evaluate_model(final_model, X, y, tscv)
-
-        print(f"✅ Modelo {target} para sucursal {sucursal} - "
-              f"MAE: {metrics['mae']:.2f} ± {metrics['mae_std']:.2f}, "
-              f"R²: {metrics['r2']:.2f} ± {metrics['r2_std']:.2f}")
-
-
-        # Guardar modelo
         filename = f"{MODEL_DIR}/predictor_{target}_{sucursal}.pkl"
-        joblib.dump(final_model, filename)
+        joblib.dump(model_cv.best_estimator_, filename)
+        print(f"✅ Modelo {target} para sucursal {sucursal} guardado en {filename}")
 
 
-def predict_future_values(df: pd.DataFrame, branch_code: str, future_dates: list, targets: list) -> dict:
-    """Predice valores futuros para una sucursal"""
+def predict_future_values(df, branch_code, future_dates, targets):
     predictions = {}
     suc_df = df[df["COD_SUC"] == branch_code].copy()
+
+    # Asegurarse de que el DataFrame histórico tenga las columnas necesarias para los lags
+    # y rolling means en prepare_features, incluso si son NaN para las fechas futuras.
+    # Aquí vamos a crear un DataFrame combinado que incluya el histórico y las fechas futuras.
+
+    # DataFrame para mantener el historial y las predicciones futuras
     df_combined_preds = suc_df.copy()
 
-    for current_date in future_dates:
+    for date_idx, current_date in enumerate(future_dates):
+        # Crear una fila para la fecha actual en el futuro
         future_row = pd.DataFrame([{
             "FECHA": current_date,
             "COD_SUC": branch_code,
+            # Inicializar las columnas target con NaN para que prepare_features las procese
             "T_AO": np.nan,
             "T_AO_VENTA": np.nan,
             "T_VISITAS": np.nan,
-            "DOTACION": np.nan
+            "DOTACION": np.nan  # También la dotación si es una feature
         }])
 
-        df_temp = pd.concat([df_combined_preds.tail(30), future_row], ignore_index=True)
+        # Concatenar para que prepare_features pueda calcular lags y rolling averages
+        # Utilizaremos el df_combined_preds que se va actualizando con las predicciones.
+        df_temp = pd.concat([df_combined_preds.tail(30), future_row],
+                            ignore_index=True)  # Solo las últimas 30 filas + la nueva para eficiencia
         df_temp = df_temp.sort_values("FECHA").reset_index(drop=True)
 
         for target in targets:
             model_filename = f"{MODEL_DIR}/predictor_{target}_{branch_code}.pkl"
             if not os.path.exists(model_filename):
-                predictions.setdefault(target, []).append(np.nan)
+                print(f"❌ Modelo para {target} y sucursal {branch_code} no encontrado.")
+                # Si el modelo no existe, la predicción será NaN
+                if target not in predictions:
+                    predictions[target] = []
+                predictions[target].append(np.nan)
                 continue
 
             model = joblib.load(model_filename)
+
+            # Preparar features para la fecha actual del futuro
+            # Se pasa el df_temp para que los lags y rolling se calculen correctamente
             X_future, _ = prepare_features(df_temp, target, is_prediction=True)
 
             if X_future.empty:
-                predictions.setdefault(target, []).append(np.nan)
+                print(f"⚠️ No se pudieron preparar features para {current_date} - {target}.")
+                if target not in predictions:
+                    predictions[target] = []
+                predictions[target].append(np.nan)
                 continue
 
-            pred = model.predict(X_future.iloc[[-1]])[0]
-            predictions.setdefault(target, []).append(pred)
+            # Tomar la última fila de X_future, que corresponde a current_date
+            X_input = X_future.iloc[[-1]]
 
-            # Actualizar df_combined_preds con la predicción
-            mask = df_combined_preds['FECHA'] == current_date
-            if mask.any():
-                df_combined_preds.loc[mask, target] = pred
-            else:
-                new_row = {"FECHA": current_date, "COD_SUC": branch_code, target: pred}
+            pred = model.predict(X_input)[0]
+
+            # Almacenar la predicción
+            if target not in predictions:
+                predictions[target] = []
+            predictions[target].append(pred)
+
+            # Actualizar el df_combined_preds con la predicción para el siguiente ciclo
+            # Encuentra la fila correspondiente a current_date y actualiza el valor
+            df_combined_preds.loc[df_combined_preds['FECHA'] == current_date, target] = pred
+
+            # Si la fila de current_date no existe (es la primera vez que se predice para esta fecha),
+            # la añadimos a df_combined_preds
+            if (df_combined_preds['FECHA'] == current_date).sum() == 0:
+                new_row = {"FECHA": current_date, "COD_SUC": branch_code}
+                new_row[target] = pred
+                # Rellenar otras columnas con valores por defecto o del histórico más reciente
                 for col in suc_df.columns:
                     if col not in new_row and col != "FECHA" and col != "COD_SUC":
                         new_row[col] = suc_df[col].iloc[-1] if not suc_df.empty else np.nan
@@ -180,58 +125,75 @@ def predict_future_values(df: pd.DataFrame, branch_code: str, future_dates: list
 if __name__ == "__main__":
     print("🔄 Cargando datos desde Excel...")
     df = load_data_from_excel("data/DOTACION_EFECTIVIDAD.xlsx")
-    print("✅ Datos cargados. Entrenando modelos...")
+    df.columns = ["COD_SUC", "FECHA", "T_AO", "T_AO_VENTA", "DOTACION", "T_VISITAS", "P_EFECTIVIDAD"]  # Si tiene 7 columnas
 
-    for target in ["T_AO", "T_AO_VENTA", "T_VISITAS", "DOTACION"]:
+    df["FECHA"] = pd.to_datetime(df["FECHA"])
+    df = df.dropna().reset_index(drop=True)
+    print("✅ Datos cargados. Entrenando modelos T_AO, T_AO_VENTA, T_VISITAS y DOTACION...") # Modificado
+
+    for target in ["T_AO", "T_AO_VENTA", "T_VISITAS", "DOTACION"]:  # Entrenar también para DOTACION # Modificado
         train_model_per_branch(df, target)
         print(f"🏁 Entrenamiento completado para {target}")
 
-    print("\n🔮 Realizando predicciones futuras...")
+    print("\n🔮 Realizando predicciones futuras y calculando dotación necesaria...")
     unique_branches = df["COD_SUC"].unique()
-    future_dates = pd.date_range(
-        start=df["FECHA"].max() + pd.Timedelta(days=1),
-        periods=7
-    ).tolist()
+    future_dates = pd.to_datetime(
+        pd.date_range(start=df["FECHA"].max() + pd.Timedelta(days=1), periods=7, freq='D'))  # Próximos 7 días
 
     for branch_code in unique_branches:
         print(f"\n--- Predicciones para Sucursal: {branch_code} ---")
-        predicted_values = predict_future_values(
-            df, branch_code, future_dates,
-            ["T_AO", "T_AO_VENTA", "T_VISITAS", "DOTACION"]
-        )
+        # Modificado para incluir DOTACION en la predicción de prueba
+        predicted_values = predict_future_values(df, branch_code, future_dates, ["T_AO", "T_AO_VENTA", "T_VISITAS", "DOTACION"])
 
-        # Estimación de parámetros de efectividad
-        df_historico = df[df["COD_SUC"] == branch_code][['DOTACION', 'T_AO', 'T_AO_VENTA']].dropna()
-        params_efectividad = estimar_parametros_efectividad(df_historico) if not df_historico.empty else None
+        t_ao_pred_arr = np.array(predicted_values.get("T_AO", []))
+        t_ao_venta_pred_arr = np.array(predicted_values.get("T_AO_VENTA", []))
 
-        # Procesar predicciones
-        t_ao_pred = np.array(predicted_values.get("T_AO", []))
-        t_ao_venta_pred = np.array(predicted_values.get("T_AO_VENTA", []))
+        # Para estimar los parámetros de efectividad, usar un subconjunto del df histórico
+        # que contenga los datos necesarios para la estimación del modelo sigmoide.
+        df_historico_para_params = df[df["COD_SUC"] == branch_code][['DOTACION', 'T_AO', 'T_AO_VENTA']].dropna()
+        if not df_historico_para_params.empty:
+            params_efectividad_sucursal = estimar_parametros_efectividad(df_historico_para_params)
+        else:
+            params_efectividad_sucursal = None  # Esto hará que estimar_dotacion_optima use valores por defecto
 
-        if np.any(~np.isnan(t_ao_pred)) and np.any(~np.isnan(t_ao_venta_pred)):
-            dotacion_optima, efectividad = estimar_dotacion_optima(
-                t_ao_pred, t_ao_venta_pred,
-                efectividad_deseada=0.8,
-                params_efectividad=params_efectividad
+        if np.any(~np.isnan(t_ao_pred_arr)) and np.any(~np.isnan(t_ao_venta_pred_arr)):
+            # Pasar las predicciones de T_AO y T_AO_VENTA para el cálculo de la dotación óptima
+            # Esto permitirá que estimar_dotacion_optima considere las particularidades de las predicciones.
+            dotacion_optima_total, efectividad_promedio_total = estimar_dotacion_optima(
+                t_ao_pred_arr,
+                t_ao_venta_pred_arr,
+                efectividad_deseada=0.8,  # Puedes ajustar la efectividad deseada aquí
+                params_efectividad=params_efectividad_sucursal
             )
-            print(f"  DOTACION Óptima Global: {dotacion_optima:.2f}")
-            print(f"  Efectividad Esperada: {efectividad:.2f}")
+            print(f"  DOTACION Óptima Global (para el período futuro): {dotacion_optima_total}")
+            print(f"  Efectividad Promedio Esperada (con dotación óptima): {efectividad_promedio_total:.2f}")
+        else:
+            print("  No hay suficientes predicciones válidas para calcular la dotación óptima global.")
 
         for i, date in enumerate(future_dates):
-            print(f"\nFecha: {date.strftime('%Y-%m-%d')}")
-            for target in ["T_AO", "T_AO_VENTA", "T_VISITAS", "DOTACION"]:
-                val = predicted_values.get(target, [np.nan])[i]
-                print(f"  {target} Predicho: {val:.2f}")
+            t_ao_pred = predicted_values.get("T_AO", [np.nan])[i]
+            t_ao_venta_pred = predicted_values.get("T_AO_VENTA", [np.nan])[i]
+            t_visitas_pred = predicted_values.get("T_VISITAS", [np.nan])[i]
+            t_dotacion_pred = predicted_values.get("DOTACION", [np.nan])[i] # Añadido para mostrar DOTACION predicha
 
-            # Cálculo diario de dotación óptima
-            if (not np.isnan(t_ao_pred[i])) and (t_ao_pred[i] > 0) and (not np.isnan(t_ao_venta_pred[i])):
-                dotacion_diaria, efectividad_diaria = estimar_dotacion_optima(
-                    np.array([t_ao_pred[i]]),
-                    np.array([t_ao_venta_pred[i]]),
+            print(f"Fecha: {date.strftime('%Y-%m-%d')}")
+            print(f"  T_AO Predicho: {t_ao_pred:.2f}")
+            print(f"  T_AO_VENTA Predicho: {t_ao_venta_pred:.2f}")
+            print(f"  T_VISITAS Predicho: {t_visitas_pred:.2f}")
+            print(f"  DOTACION Predicha: {t_dotacion_pred:.2f}") # Añadido para mostrar DOTACION predicha
+
+
+            # Calcular la dotación necesaria para cada día individualmente si es necesario
+            if not np.isnan(t_ao_pred) and t_ao_pred > 0 and not np.isnan(t_ao_venta_pred):
+                dotacion_necesaria_diaria, efectividad_diaria_resultante = estimar_dotacion_optima(
+                    np.array([t_ao_pred]),
+                    np.array([t_ao_venta_pred]),
                     efectividad_deseada=0.8,
-                    params_efectividad=params_efectividad
+                    params_efectividad=params_efectividad_sucursal
                 )
-                print(f"  DOTACION Diaria Óptima: {dotacion_diaria:.2f}")
-                print(f"  Efectividad Diaria: {efectividad_diaria:.2f}")
+                print(f"  DOTACION Necesaria Diaria: {dotacion_necesaria_diaria}")
+                print(f"  Efectividad Diaria Esperada: {efectividad_diaria_resultante:.2f}")
+            else:
+                print("  No se puede calcular DOTACION necesaria (T_AO o T_AO_VENTA predicho es inválido o cero).")
 
-    print("\n🏁 Proceso completado.")
+    print("\n🏁 Proceso de entrenamiento, predicción y cálculo de dotación completado.")

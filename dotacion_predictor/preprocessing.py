@@ -1,178 +1,95 @@
 import pandas as pd
 import numpy as np
 import holidays
-from sklearn.preprocessing import MinMaxScaler
-from typing import Tuple
 
 
-def prepare_features(df: pd.DataFrame, target: str, is_prediction: bool = False) -> Tuple[pd.DataFrame, pd.Series]:
+def prepare_features(df: pd.DataFrame, target: str, is_prediction: bool = False):
     """
-    Prepara las features para el modelo, incluyendo nuevas características de ingeniería avanzada.
+    Prepara las features para entrenamiento de modelos predictivos o para predicción futura.
+    Incluye variables temporales, rezagos y rolling averages.
 
     Args:
-        df: DataFrame con los datos históricos
-        target: Variable objetivo a predecir
-        is_prediction: Si es True, prepara datos para predicción (sin target)
+        df (pd.DataFrame): DataFrame de entrada con los datos.
+        target (str): Nombre de la columna objetivo.
+        is_prediction (bool): True si se está preparando datos para predicción futura,
+                              False para entrenamiento.
 
     Returns:
-        Tuple con features (X) y target (y) si no es predicción
+        tuple: (X, y) donde X es el DataFrame de features e y es la Serie objetivo.
+               Si is_prediction es True, y será una Serie de NaNs o un valor placeholder.
     """
-    # Crear copia para no modificar el original
     df = df.copy()
 
-    # 1. Procesamiento básico de fechas
-    df = _process_dates(df)
-
-    # 2. Features de tendencia y crecimiento
-    df = _add_trend_features(df, target)
-
-    # 3. Features de día de semana y mes
-    df = _add_date_features(df)
-
-    # 4. Features de ventanas móviles
-    df = _add_window_features(df, target)
-
-    # 5. Features cíclicas
-    df = _add_cyclic_features(df)
-
-    # 6. Features externas
-    df = _add_external_features(df)
-
-    # 7. Features de lag
-    df = _add_lag_features(df, target)
-
-    # 8. Normalización
-    df = _normalize_features(df)
-
-    # Preparar X e y
-    features_to_drop = ['COD_SUC', 'FECHA', target] if not is_prediction else ['COD_SUC', 'FECHA']
-    X = df.drop(columns=features_to_drop, errors='ignore')
-
-    # Eliminar columnas con muchos nulos
-    X = X.dropna(axis=1, thresh=0.7 * len(X))
-
-    # Imputar valores faltantes
-    for col in X.columns:
-        if X[col].isna().any():
-            if col.startswith('rolling'):
-                X[col].fillna(method='ffill', inplace=True)
-                X[col].fillna(method='bfill', inplace=True)
-            else:
-                X[col].fillna(X[col].median(), inplace=True)
-
-    if is_prediction:
-        return X, None
-    else:
-        y = df[target]
-        return X, y
-
-
-def _process_dates(df: pd.DataFrame) -> pd.DataFrame:
-    """Procesamiento básico de fechas"""
+    # Asegurarse de que 'FECHA' sea datetime y ordenar
     df['FECHA'] = pd.to_datetime(df['FECHA'])
-    df = df.sort_values('FECHA').reset_index(drop=True)
-    df['dia_mes'] = df['FECHA'].dt.day
-    df['dia_semana'] = df['FECHA'].dt.dayofweek
-    df['mes'] = df['FECHA'].dt.month
-    df['trimestre'] = df['FECHA'].dt.quarter
-    df['es_fin_de_semana'] = df['dia_semana'].isin([5, 6]).astype(int)
-    return df
+    df = df.sort_values("FECHA").reset_index(drop=True)
 
+    # Variables temporales
+    df["year"] = df["FECHA"].dt.year
+    df["month"] = df["FECHA"].dt.month
+    df["day"] = df["FECHA"].dt.day
+    df["weekday"] = df["FECHA"].dt.weekday  # 0=Lunes, 6=Domingo
+    df["dayofyear"] = df["FECHA"].dt.dayofyear
+    df["weekofyear"] = df["FECHA"].dt.isocalendar().week.astype(int)
+    df["is_weekend"] = df["weekday"] >= 5
 
-def _add_trend_features(df: pd.DataFrame, target: str) -> pd.DataFrame:
-    """Añade features de tendencia y crecimiento"""
-    # Tendencia respecto a promedio de 30 días
-    df[f'{target}_rolling30'] = df[target].rolling(30, min_periods=1).mean()
-    df[f'{target}_trend'] = df[target] - df[f'{target}_rolling30']
+    # Añadir feriados chilenos (considerando un rango amplio de años)
+    min_year = df['FECHA'].min().year - 1 if not df.empty else 2020
+    max_year = df['FECHA'].max().year + 2 if not df.empty else 2025
+    chile_holidays = holidays.Chile(years=range(min_year, max_year))
+    df['is_holiday'] = df['FECHA'].apply(lambda x: x.date() in chile_holidays)
 
-    # Cambio porcentual diario y semanal
-    df[f'{target}_pct_change'] = df[target].pct_change()
-    df[f'{target}_pct_change_7d'] = df[target].pct_change(7)
+    # Columnas para rezagos y rolling averages
+    # Incluimos explícitamente T_AO, T_AO_VENTA, T_VISITAS, DOTACION para los lags
+    lag_cols = ["T_AO", "T_AO_VENTA", "T_VISITAS", "DOTACION"]
 
-    # Días especiales del mes
-    df['es_primer_dia_mes'] = (df['dia_mes'] == 1).astype(int)
-    df['es_ultimo_dia_mes'] = (df['FECHA'].dt.is_month_end).astype(int)
+    for col in lag_cols:
+        # Asegurarse de que las columnas existan, rellenando con 0 o NaN si no
+        if col not in df.columns:
+            df[col] = np.nan  # Inicializar si la columna no existe
 
-    return df
+        # Shift(1) para evitar data leakage, asegurando que solo usamos información pasada
+        # Usamos .fillna(0) para las primeras filas después del shift si es numérico
+        df[f"{col}_lag1"] = df[col].shift(1)
+        # Considerar un min_periods de 1 para los rolling averages
+        # Aseguramos que el rolling se calcule sobre los valores ya existentes o históricos
+        df[f"{col}_rolling7"] = df[col].shift(1).rolling(window=7, min_periods=1).mean()
+        df[f"{col}_rolling14"] = df[col].shift(1).rolling(window=14, min_periods=1).mean()
 
+    # Definir las características que se usarán en el modelo
+    features = [
+        "year", "month", "day", "weekday", "dayofyear", "weekofyear",
+        "is_weekend", "is_holiday"
+    ]
 
-def _add_date_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Añade features basadas en día de semana y mes"""
-    # Promedios históricos por día de semana
-    for target in ['T_AO', 'T_AO_VENTA', 'T_VISITAS']:
-        if target in df.columns:
-            df[f'mean_{target}_weekday'] = df.groupby('dia_semana')[target].transform('mean')
-            df[f'median_{target}_weekday'] = df.groupby('dia_semana')[target].transform('median')
+    for col in lag_cols:
+        features.extend([f"{col}_lag1", f"{col}_rolling7", f"{col}_rolling14"])
 
-    # Feriados chilenos
-    cl_holidays = holidays.CountryHoliday('CL')
-    df['es_feriado'] = df['FECHA'].apply(lambda x: x in cl_holidays).astype(int)
+    # Asegurarse de que todas las columnas de características existan en el DataFrame antes de seleccionarlas
+    for feat in features:
+        if feat not in df.columns:
+            df[feat] = np.nan  # Rellenar con NaN si no existen
 
-    return df
+    # Si estamos en modo de predicción, los valores 'y' no son conocidos.
+    if is_prediction:
+        X = df[features].copy()
+        # Rellenar NaNs en las features. Para variables numéricas, podríamos usar 0 o una estrategia más avanzada.
+        # Para booleanos, False es un buen valor por defecto.
+        for col in X.columns:
+            if pd.api.types.is_numeric_dtype(X[col]):
+                X[col] = X[col].fillna(0)  # Rellenar NaNs en features numéricas con 0
+            elif pd.api.types.is_bool_dtype(X[col]):
+                X[col] = X[col].fillna(False)
+        y = pd.Series([np.nan] * len(df), index=df.index)  # El target es desconocido
+    else:
+        # Para entrenamiento, eliminamos las filas con NaNs en las características y el target
+        # Esto asegura que el modelo se entrene solo con datos completos y válidos.
+        # Es crucial que target exista en df para el entrenamiento
+        if target not in df.columns:
+            raise ValueError(f"La columna objetivo '{target}' no se encuentra en el DataFrame para el entrenamiento.")
 
+        df_cleaned = df.dropna(subset=features + [target])
+        X = df_cleaned[features]
+        y = df_cleaned[target]
 
-def _add_window_features(df: pd.DataFrame, target: str) -> pd.DataFrame:
-    """Añade features de ventanas móviles"""
-    windows = [3, 7, 14, 30]
-    for window in windows:
-        df[f'{target}_rolling{window}_mean'] = df[target].rolling(window, min_periods=1).mean()
-        df[f'{target}_rolling{window}_std'] = df[target].rolling(window, min_periods=1).std()
-
-    # Diferencia entre ventanas cortas y largas
-    df[f'{target}_diff_rolling7_30'] = df[f'{target}_rolling7_mean'] - df[f'{target}_rolling30_mean']
-
-    return df
-
-
-def _add_cyclic_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Añade features cíclicas para día de semana y mes"""
-    # Codificación cíclica para día de semana
-    df['dia_semana_sin'] = np.sin(2 * np.pi * df['dia_semana'] / 7)
-    df['dia_semana_cos'] = np.cos(2 * np.pi * df['dia_semana'] / 7)
-
-    # Codificación cíclica para mes
-    df['mes_sin'] = np.sin(2 * np.pi * df['mes'] / 12)
-    df['mes_cos'] = np.cos(2 * np.pi * df['mes'] / 12)
-
-    return df
-
-
-def _add_external_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Añade features externas (simuladas)"""
-    # Días de pago (simulado - días 5 y 20 de cada mes)
-    df['es_dia_pago'] = df['dia_mes'].isin([5, 20]).astype(int)
-
-    # Eventos comerciales (simulado - últimos 5 días de cada mes)
-    df['es_evento_comercial'] = (df['dia_mes'] >= 25).astype(int)
-
-    return df
-
-
-def _add_lag_features(df: pd.DataFrame, target: str) -> pd.DataFrame:
-    """Añade features de lag"""
-    lags = [1, 2, 3, 7, 14, 30]
-    for lag in lags:
-        df[f'{target}_lag{lag}'] = df[target].shift(lag)
-
-    return df
-
-
-def _normalize_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalización de features numéricas"""
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    cols_to_normalize = [col for col in numeric_cols if col not in ['COD_SUC', 'es_feriado', 'es_fin_de_semana',
-                                                                    'es_primer_dia_mes', 'es_ultimo_dia_mes',
-                                                                    'es_dia_pago', 'es_evento_comercial']]
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    for col in cols_to_normalize:
-        if df[col].isnull().any():
-            if df[col].dtype == 'float64' or df[col].dtype == 'int64':
-                df[col].fillna(df[col].median(), inplace=True)
-            else: # para el caso de que la columna sea de otro tipo y tenga NaN
-                df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else 0, inplace=True)
-
-
-    scaler = MinMaxScaler()
-    df[cols_to_normalize] = scaler.fit_transform(df[cols_to_normalize])
-
-    return df
+    return X, y

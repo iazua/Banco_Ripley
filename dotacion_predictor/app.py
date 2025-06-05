@@ -6,7 +6,7 @@ import os
 from datetime import timedelta
 from preprocessing import prepare_features
 from utils import calcular_efectividad, estimar_dotacion_optima, _modelo_efectividad, estimar_parametros_efectividad
-import joblib
+
 # --- CONFIGURACIÓN INICIAL ---
 st.set_page_config(page_title="Predicción de Dotación Óptima", layout="wide")
 st.image("https://www.fide.edu.pe/wp-content/uploads/2021/08/banco-ripley.jpg", width=200)
@@ -54,70 +54,66 @@ efectividad_deseada = st.slider(
 
 
 # --- FUNCIONES AUXILIARES ---
-# ------------ FUNCIÓN: cargar_modelo() -----------------------------------------------
-def cargar_modelo(variable: str, cod_suc: int):
-    """
-    Devuelve el modelo entrenado para la variable y sucursal indicadas.
-    Los modelos se guardan con joblib.dump(...) => se leen con joblib.load(...).
-    """
-    ruta = f"models/predictor_{variable}_{cod_suc}.pkl"
-    if os.path.exists(ruta):
-        try:
-            return joblib.load(ruta)      # 💡 lectura directa; sin abrir el fichero a mano
-        except Exception as e:
-            st.error(f"Error cargando {ruta}: {e}")
-    else:
-        st.error(f"No se encontró el modelo para {variable} en la sucursal {cod_suc}")
+def cargar_modelo(variable, cod_suc):
+    path = f"models/predictor_{variable}_{cod_suc}.pkl"
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    st.error(f"No se encontró el modelo para {variable} en sucursal {cod_suc}")
     return None
-# --------------------------------------------------------------------------------------
 
 
-
-# ------------ FUNCIÓN: generar_predicciones() -----------------------------------------
-def generar_predicciones(df_hist: pd.DataFrame,
-                         model,
-                         target: str,
-                         n_dias: int = 35) -> pd.DataFrame:
-    """
-    Predicciones recursivas n_dias hacia delante.
-    - Genera features con el mismo pipeline de entrenamiento (`prepare_features`)
-    - Alinea X con las columnas que espera el modelo (model.feature_names_in_)
-    """
+def generar_predicciones(df_hist, model, target):
     df_pred = df_hist.copy()
-    fecha_ref = df_pred["FECHA"].max()
-    fechas, y_hat = [], []
+    last_date = df_pred["FECHA"].max()
+    predicciones = []
+    fechas = []
 
-    for _ in range(n_dias):
-        sig_dia = fecha_ref + timedelta(days=1)
+    for _ in range(n_dias_forecast):
+        next_date = last_date + timedelta(days=1)
+        df_for_features = df_pred.tail(100).copy()
+        temp_row = pd.DataFrame([df_for_features.iloc[-1]]).copy()
+        temp_row['FECHA'] = next_date
 
-        # 1️⃣ fila “vacía” para el día siguiente
-        fila_tmp = df_pred.iloc[-1:].copy()
-        fila_tmp["FECHA"] = sig_dia
-        fila_tmp[target] = np.nan                       # target a predecir
-        df_ext = pd.concat([df_pred, fila_tmp], ignore_index=True)
+        if target in temp_row.columns:
+            temp_row[target] = np.nan
 
-        # 2️⃣ features
-        X_pred, _ = prepare_features(df_ext, target, is_prediction=True)
-        if X_pred.empty:
-            st.warning(f"No se pudieron generar features para {target} en {sig_dia.date()}.")
+        for prev_target_col in ["T_AO", "T_AO_VENTA", "T_VISITAS", "DOTACION", "P_EFECTIVIDAD"]:
+            predicted_col_name = f"{prev_target_col}_pred"
+            if predicted_col_name in df_pred.columns and not df_pred[predicted_col_name].isnull().all():
+                last_pred_val = df_pred[predicted_col_name].ffill().iloc[-1]
+                temp_row[prev_target_col] = last_pred_val
+            elif prev_target_col in df_pred.columns and not df_pred[prev_target_col].isnull().all():
+                last_real_val = df_pred[prev_target_col].ffill().iloc[-1]
+                temp_row[prev_target_col] = last_real_val
+            elif prev_target_col in df_hist.columns and not df_hist[prev_target_col].isnull().all():
+                temp_row[prev_target_col] = df_hist[prev_target_col].ffill().iloc[-1]
+
+        df_for_features = pd.concat([df_for_features, temp_row], ignore_index=True).sort_values("FECHA").reset_index(
+            drop=True)
+        X_pred, _ = prepare_features(df_for_features, target, is_prediction=True)
+
+        if X_pred is not None and len(X_pred) > 0:
+            X_input = X_pred.iloc[[-1]]
+            y_pred = model.predict(X_input)[0]
+            predicciones.append(y_pred)
+            fechas.append(next_date)
+
+            new_pred_row_dict = {"FECHA": next_date, f"{target}_pred": y_pred}
+            for col in df_hist.columns:
+                if col not in new_pred_row_dict:
+                    if col in temp_row.columns:
+                        new_pred_row_dict[col] = temp_row[col].values[0]
+                    elif col in df_pred.columns:
+                        new_pred_row_dict[col] = df_pred[col].iloc[-1]
+
+            df_pred = pd.concat([df_pred, pd.DataFrame([new_pred_row_dict])], ignore_index=True)
+        else:
+            st.warning(f"No se pudieron generar features para {target} en fecha {next_date}.")
             break
+        last_date = next_date
 
-        # 3️⃣ Alinear columnas con las del modelo
-        cols_modelo = getattr(model, "feature_names_in_", X_pred.columns)
-        X_input = pd.DataFrame({c: X_pred.iloc[-1].get(c, 0) for c in cols_modelo}, index=[0])
-
-        # 4️⃣ predicción
-        y_pred = model.predict(X_input)[0]
-        y_hat.append(y_pred)
-        fechas.append(sig_dia)
-
-        # 5️⃣ incorporar la predicción al histórico (para lags de la siguiente iteración)
-        fila_tmp[target] = y_pred
-        df_pred = pd.concat([df_pred, fila_tmp], ignore_index=True)
-        fecha_ref = sig_dia
-
-    return pd.DataFrame({"FECHA": fechas, f"{target}_pred": y_hat})
-# --------------------------------------------------------------------------------------
+    return pd.DataFrame({"FECHA": fechas, f"{target}_pred": predicciones})
 
 
 # --- CARGA DE MODELOS Y GENERACIÓN DE PREDICCIONES ---
@@ -411,7 +407,9 @@ if modelo_tao and modelo_venta and modelo_visitas:
     dotacion_rango = np.arange(0, 21)
     efectividad_esperada_curva = []
 
-    avg_t_ao_venta_curva = 100
+    avg_t_ao_venta_curva = np.nanmean(
+        df_display['Acepta Oferta requerida']) if 'Acepta Oferta requerida' in df_display.columns else np.nanmean(
+        df_display.get('Ventas Concretadas esperada', np.nan))
 
     if pd.notna(avg_t_ao_venta_curva) and avg_t_ao_venta_curva > 0:
         for dot_val in dotacion_rango:
